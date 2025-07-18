@@ -1,7 +1,7 @@
 import time
 import argparse
 import pickle
-from model import *
+from model import * # <--- CHANGE: Import the new model
 from utils import *
 
 
@@ -34,6 +34,10 @@ parser.add_argument('--validation', action='store_true', help='validation')
 parser.add_argument('--valid_portion', type=float, default=0.1, help='split the portion')
 parser.add_argument('--alpha', type=float, default=0.2, help='Alpha for the leaky_relu.')
 parser.add_argument('--patience', type=int, default=3)
+# <<< START: ADDED FROM TAGNN >>>
+# این آرگومان برای کنترل بخش ترکیبی در محاسبه بردار جلسه اضافه شده است
+parser.add_argument('--nonhybrid', action='store_true', help='only use the global preference to predict')
+# <<< END: ADDED FROM TAGNN >>>
 
 opt = parser.parse_args()
 
@@ -72,7 +76,9 @@ def main():
     test_data = Data(test_data)
 
     adj, num = handle_adj(adj, num_node, opt.n_sample_all, num)
-    model = trans_to_cuda(CombineGraph(opt, num_node, adj, num))
+    
+    # <--- CHANGE: Instantiate the new GC_TAGNN model ---
+    model = trans_to_cuda(GC_TAGNN(opt, num_node, adj, num))
 
     print(opt)
     start = time.time()

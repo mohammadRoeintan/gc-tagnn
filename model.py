@@ -1,6 +1,5 @@
 import datetime
 import math
-import numpy as np
 import torch
 from torch import nn
 from tqdm import tqdm
@@ -9,9 +8,9 @@ from torch.nn import Module, Parameter
 import torch.nn.functional as F
 
 
-class CombineGraph(Module):
+class GC_TAGNN(Module):
     def __init__(self, opt, num_node, adj_all, num):
-        super(CombineGraph, self).__init__()
+        super(GC_TAGNN, self).__init__()
         self.opt = opt
 
         self.batch_size = opt.batch_size
@@ -23,6 +22,11 @@ class CombineGraph(Module):
         self.sample_num = opt.n_sample
         self.adj_all = trans_to_cuda(torch.Tensor(adj_all)).long()
         self.num = trans_to_cuda(torch.Tensor(num)).float()
+        
+        # <<< START: ADDED FROM TAGNN >>>
+        # این آرگومان برای سازگاری با منطق اصلی TAGNN اضافه شده است
+        self.nonhybrid = opt.nonhybrid 
+        # <<< END: ADDED FROM TAGNN >>>
 
         # Aggregator
         self.local_agg = LocalAggregator(self.dim, self.opt.alpha, dropout=0.0)
@@ -35,18 +39,19 @@ class CombineGraph(Module):
             self.add_module('agg_gcn_{}'.format(i), agg)
             self.global_agg.append(agg)
 
-        # Item representation & Position representation
+        # Item representation
         self.embedding = nn.Embedding(num_node, self.dim)
-        self.pos_embedding = nn.Embedding(200, self.dim)
 
-        # Parameters
-        self.w_1 = nn.Parameter(torch.Tensor(2 * self.dim, self.dim))
-        self.w_2 = nn.Parameter(torch.Tensor(self.dim, 1))
-        self.glu1 = nn.Linear(self.dim, self.dim)
-        self.glu2 = nn.Linear(self.dim, self.dim, bias=False)
-        self.linear_transform = nn.Linear(self.dim, self.dim, bias=False)
+        # <<< START: LAYERS FOR TARGET ATTENTION (from TAGNN) >>>
+        # این لایه‌ها مستقیماً از مدل TAGNN برای پیاده‌سازی مکانیزم‌های توجه اضافه شده‌اند
+        self.linear_one = nn.Linear(self.dim, self.dim, bias=True)
+        self.linear_two = nn.Linear(self.dim, self.dim, bias=True)
+        self.linear_three = nn.Linear(self.dim, 1, bias=False)
+        self.linear_transform = nn.Linear(self.dim * 2, self.dim, bias=True)
+        # لایه کلیدی برای مکانیزم توجه به هدف
+        self.linear_t = nn.Linear(self.dim, self.dim, bias=False)  
+        # <<< END: LAYERS FOR TARGET ATTENTION >>>
 
-        self.leakyrelu = nn.LeakyReLU(opt.alpha)
         self.loss_function = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=opt.lr_dc_step, gamma=opt.lr_dc)
@@ -59,43 +64,73 @@ class CombineGraph(Module):
             weight.data.uniform_(-stdv, stdv)
 
     def sample(self, target, n_sample):
-        # neighbor = self.adj_all[target.view(-1)]
-        # index = np.arange(neighbor.shape[1])
-        # np.random.shuffle(index)
-        # index = index[:n_sample]
-        # return self.adj_all[target.view(-1)][:, index], self.num[target.view(-1)][:, index]
         return self.adj_all[target.view(-1)], self.num[target.view(-1)]
 
+    # --------------------------------------------------------------------------------
+    # <<< THIS IS THE NEW COMPUTE_SCORES METHOD, ADAPTED FROM TAGNN >>>
+    # --------------------------------------------------------------------------------
     def compute_scores(self, hidden, mask):
-        mask = mask.float().unsqueeze(-1)
+        """
+        این متد به طور کامل با منطق امتیازدهی TAGNN جایگزین شده است.
+        ورودی `hidden` همان بازنمایی آیتم‌هاست که از بخش GNN (ترکیب زمینه محلی و سراسری) به دست آمده است.
+        """
+        # گام ۱: محاسبه بردار جلسه عمومی (بدون توجه به هدف)
+        # ht بازنمایی آخرین آیتم در جلسه است
+        ht = hidden[torch.arange(mask.shape[0]).long(), torch.sum(mask, 1) - 1]  # (batch_size, hidden_size)
+        
+        # محاسبه وزن توجه برای ترکیب بازنمایی آیتم‌های جلسه
+        q1 = self.linear_one(ht).view(ht.shape[0], 1, ht.shape[1])  # (batch_size, 1, hidden_size)
+        q2 = self.linear_two(hidden)  # (batch_size, seq_length, hidden_size)
+        alpha = self.linear_three(torch.sigmoid(q1 + q2)) # (batch_size, seq_length, 1)
+        alpha = F.softmax(alpha, 1) # نرمال‌سازی وزن‌ها
+        
+        # s_global بردار وزنی از تمام آیتم‌های جلسه است
+        s_global = torch.sum(alpha * hidden * mask.view(mask.shape[0], -1, 1).float(), 1)  # (batch_size, hidden_size)
+        
+        # ترکیب بردار جلسه عمومی با بازنمایی آخرین آیتم
+        if not self.nonhybrid:
+            s_hybrid = self.linear_transform(torch.cat([s_global, ht], 1))
+        else:
+            s_hybrid = s_global
 
-        batch_size = hidden.shape[0]
-        len = hidden.shape[1]
-        pos_emb = self.pos_embedding.weight[:len]
-        pos_emb = pos_emb.unsqueeze(0).repeat(batch_size, 1, 1)
+        # گام ۲: محاسبه بخش توجه به هدف (Target-Aware Attention)
+        # b بازنمایی تمام آیتم‌های کاندید در دیتاست است
+        b = self.embedding.weight[1:]  # (n_nodes, hidden_size)
+        
+        masked_hidden = hidden * mask.view(mask.shape[0], -1, 1).float()
+        
+        # اعمال ترنسفورمیشن خطی روی بازنمایی آیتم‌های جلسه برای محاسبه توجه به هدف
+        qt = self.linear_t(masked_hidden)  # (batch_size, seq_length, hidden_size)
+        
+        # محاسبه امتیاز توجه برای هر آیتم کاندید نسبت به تمام آیتم‌های جلسه
+        beta = F.softmax(b @ qt.transpose(1, 2), -1)  # (batch_size, n_nodes, seq_length)
+        
+        # s_target بردار جلسه وابسته به هدف است
+        s_target = beta @ masked_hidden  # (batch_size, n_nodes, hidden_size)
 
-        hs = torch.sum(hidden * mask, -2) / torch.sum(mask, 1)
-        hs = hs.unsqueeze(-2).repeat(1, len, 1)
-        nh = torch.matmul(torch.cat([pos_emb, hidden], -1), self.w_1)
-        nh = torch.tanh(nh)
-        nh = torch.sigmoid(self.glu1(nh) + self.glu2(hs))
-        beta = torch.matmul(nh, self.w_2)
-        beta = beta * mask
-        select = torch.sum(beta * hidden, 1)
+        # گام ۳: ترکیب بردارها و محاسبه امتیاز نهایی
+        s_hybrid_view = s_hybrid.view(hidden.shape[0], 1, hidden.shape[2]) # (batch_size, 1, hidden_size)
+        
+        # بردار نهایی جلسه از ترکیب بخش عمومی و بخش وابسته به هدف به دست می‌آید
+        final_session_representation = s_hybrid_view + s_target # (batch_size, n_nodes, hidden_size)
 
-        b = self.embedding.weight[1:]  # n_nodes x latent_size
-        scores = torch.matmul(select, b.transpose(1, 0))
+        # محاسبه امتیاز نهایی با ضرب داخلی
+        scores = torch.sum(final_session_representation * b, -1)  # (batch_size, n_nodes)
+        
         return scores
+    # --------------------------------------------------------------------------------
+    # <<< END OF NEW METHOD >>>
+    # --------------------------------------------------------------------------------
 
     def forward(self, inputs, adj, mask_item, item):
         batch_size = inputs.shape[0]
         seqs_len = inputs.shape[1]
         h = self.embedding(inputs)
 
-        # local
+        # Local graph aggregation (from GCE-GNN)
         h_local = self.local_agg(h, adj, mask_item)
 
-        # global
+        # Global graph aggregation (from GCE-GNN)
         item_neighbors = [inputs]
         weight_neighbors = []
         support_size = seqs_len
@@ -111,13 +146,7 @@ class CombineGraph(Module):
 
         session_info = []
         item_emb = self.embedding(item) * mask_item.float().unsqueeze(-1)
-        
-        # mean 
         sum_item_emb = torch.sum(item_emb, 1) / torch.sum(mask_item.float(), -1).unsqueeze(-1)
-        
-        # sum
-        # sum_item_emb = torch.sum(item_emb, 1)
-        
         sum_item_emb = sum_item_emb.unsqueeze(-2)
         for i in range(self.hop):
             session_info.append(sum_item_emb.repeat(1, entity_vectors[i].shape[1], 1))
@@ -138,7 +167,7 @@ class CombineGraph(Module):
 
         h_global = entity_vectors[0].view(batch_size, seqs_len, self.dim)
 
-        # combine
+        # Combine local and global representations
         h_local = F.dropout(h_local, self.dropout_local, training=self.training)
         h_global = F.dropout(h_global, self.dropout_global, training=self.training)
         output = h_local + h_global
