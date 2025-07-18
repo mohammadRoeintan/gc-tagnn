@@ -3,6 +3,7 @@ import argparse
 import pickle
 from model import * # <--- CHANGE: Import the new model
 from utils import *
+import numpy as np
 
 
 def init_seed(seed=None):

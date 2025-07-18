@@ -6,6 +6,7 @@ from tqdm import tqdm
 from aggregator import LocalAggregator, GlobalAggregator
 from torch.nn import Module, Parameter
 import torch.nn.functional as F
+import numpy as np
 
 
 class GC_TAGNN(Module):
