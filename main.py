@@ -50,6 +50,11 @@ def main():
         opt.n_iter = 2
         opt.dropout_gcn = 0.2
         opt.dropout_local = 0.0
+    elif opt.dataset == 'yoochoose1_64' or opt.dataset == 'yoochoose1_4':
+        num_node = 37484
+        opt.n_iter = 2
+        opt.dropout_gcn = 0.2
+        opt.dropout_local = 0.0
     elif opt.dataset == 'Nowplaying':
         num_node = 60417
         opt.n_iter = 1

@@ -17,6 +17,8 @@ elif dataset == "Tmall":
     num = 40728
 elif dataset == "Nowplaying":
     num = 60417
+elif dataset == 'yoochoose1_64' or dataset == 'yoochoose1_4':
+    num = 37484
 else:
     num = 3
 
