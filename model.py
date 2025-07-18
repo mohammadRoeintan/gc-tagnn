@@ -20,6 +20,8 @@ class GC_TAGNN(Module):
         self.sample_num = opt.n_sample
         self.adj_all = trans_to_cuda(torch.Tensor(adj_all)).long()
         self.num = trans_to_cuda(torch.Tensor(num)).float()
+        self.use_global = opt.use_global  # flag to enable/disable global graph
+        self.session_threshold = opt.session_threshold  # e.g., 5
 
         self.embedding = nn.Embedding(num_node, self.dim)
         self.local_agg = LocalAggregator(self.dim, self.opt.alpha, dropout=0.0)
@@ -36,10 +38,6 @@ class GC_TAGNN(Module):
         self.linear_three = nn.Linear(self.dim, 1, bias=False)
         self.linear_transform = nn.Linear(self.dim * 2, self.dim)
         self.linear_t = nn.Linear(self.dim, self.dim)
-
-        # Gated fusion: new
-        self.linear_gate = nn.Linear(self.dim * 2, self.dim)
-        self.sigmoid = nn.Sigmoid()
 
         self.loss_function = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.Adam(self.parameters(), lr=opt.lr, weight_decay=opt.l2)
@@ -80,48 +78,50 @@ class GC_TAGNN(Module):
         h = self.embedding(inputs)
         h_local = self.local_agg(h, adj, mask_item)
 
-        # --- Global aggregation ---
-        item_neighbors = [inputs]
-        weight_neighbors = []
-        support_size = seqs_len
+        # Adaptive: Only use global graph if session is long
+        use_global_flag = (seqs_len >= self.session_threshold) and self.use_global
 
-        for i in range(1, self.hop + 1):
-            item_sample_i, weight_sample_i = self.sample(item_neighbors[-1], self.sample_num)
-            support_size *= self.sample_num
-            item_neighbors.append(item_sample_i.view(batch_size, support_size))
-            weight_neighbors.append(weight_sample_i.view(batch_size, support_size))
+        if use_global_flag:
+            item_neighbors = [inputs]
+            weight_neighbors = []
+            support_size = seqs_len
 
-        entity_vectors = [self.embedding(i) for i in item_neighbors]
-        session_info = []
-        item_emb = self.embedding(item) * mask_item.float().unsqueeze(-1)
-        sum_item_emb = torch.sum(item_emb, 1) / torch.sum(mask_item.float(), -1).unsqueeze(-1)
-        sum_item_emb = sum_item_emb.unsqueeze(-2)
+            for i in range(1, self.hop + 1):
+                item_sample_i, weight_sample_i = self.sample(item_neighbors[-1], self.sample_num)
+                support_size *= self.sample_num
+                item_neighbors.append(item_sample_i.view(batch_size, support_size))
+                weight_neighbors.append(weight_sample_i.view(batch_size, support_size))
 
-        for i in range(self.hop):
-            session_info.append(sum_item_emb.repeat(1, entity_vectors[i].shape[1], 1))
+            entity_vectors = [self.embedding(i) for i in item_neighbors]
+            session_info = []
+            item_emb = self.embedding(item) * mask_item.float().unsqueeze(-1)
+            sum_item_emb = torch.sum(item_emb, 1) / torch.sum(mask_item.float(), -1).unsqueeze(-1)
+            sum_item_emb = sum_item_emb.unsqueeze(-2)
 
-        for n_hop in range(self.hop):
-            entity_vectors_next_iter = []
-            shape = [batch_size, -1, self.sample_num, self.dim]
-            for hop in range(self.hop - n_hop):
-                aggregator = self.global_agg[n_hop]
-                vector = aggregator(
-                    self_vectors=entity_vectors[hop],
-                    neighbor_vector=entity_vectors[hop + 1].view(shape),
-                    masks=None,
-                    batch_size=batch_size,
-                    neighbor_weight=weight_neighbors[hop].view(batch_size, -1, self.sample_num),
-                    extra_vector=session_info[hop])
-                entity_vectors_next_iter.append(vector)
-            entity_vectors = entity_vectors_next_iter
+            for i in range(self.hop):
+                session_info.append(sum_item_emb.repeat(1, entity_vectors[i].shape[1], 1))
 
-        h_global = entity_vectors[0].view(batch_size, seqs_len, self.dim)
+            for n_hop in range(self.hop):
+                entity_vectors_next_iter = []
+                shape = [batch_size, -1, self.sample_num, self.dim]
+                for hop in range(self.hop - n_hop):
+                    aggregator = self.global_agg[n_hop]
+                    vector = aggregator(self_vectors=entity_vectors[hop],
+                                        neighbor_vector=entity_vectors[hop + 1].view(shape),
+                                        masks=None,
+                                        batch_size=batch_size,
+                                        neighbor_weight=weight_neighbors[hop].view(batch_size, -1, self.sample_num),
+                                        extra_vector=session_info[hop])
+                    entity_vectors_next_iter.append(vector)
+                entity_vectors = entity_vectors_next_iter
 
-        # --- Gated fusion ---
-        h_local = F.dropout(h_local, self.opt.dropout_local, training=self.training)
-        h_global = F.dropout(h_global, self.opt.dropout_global, training=self.training)
-        gate = self.sigmoid(self.linear_gate(torch.cat([h_local, h_global], -1)))
-        output = gate * h_global + (1 - gate) * h_local
+            h_global = entity_vectors[0].view(batch_size, seqs_len, self.dim)
+            h_local = F.dropout(h_local, self.opt.dropout_local, training=self.training)
+            h_global = F.dropout(h_global, self.opt.dropout_global, training=self.training)
+            output = h_local + h_global
+        else:
+            output = F.dropout(h_local, self.opt.dropout_local, training=self.training)
+
         return output
 
 

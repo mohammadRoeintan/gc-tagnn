@@ -39,6 +39,9 @@ parser.add_argument('--patience', type=int, default=3)
 # این آرگومان برای کنترل بخش ترکیبی در محاسبه بردار جلسه اضافه شده است
 parser.add_argument('--nonhybrid', action='store_true', help='only use the global preference to predict')
 # <<< END: ADDED FROM TAGNN >>>
+parser.add_argument('--use_global', action='store_true', help='استفاده از global graph فقط در سشن‌های بلند')
+parser.add_argument('--session_threshold', type=int, default=5, help='آستانه تشخیص سشن بلند')
+
 
 opt = parser.parse_args()
 
